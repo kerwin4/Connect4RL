@@ -1,3 +1,6 @@
+# ML2026 Final Project - PPO Reinforcement Learning
+This repository builds on the work by @Patrickdg to implement a ppo agent to play connect 4 and compare its performance to other models. The implementation is done using gymnasium and stable_baselines3.
+
 # Connect 4 Reinforcement Learning Agent
 This project implements a basic Reinforcement Learning (RL) agent to play the game Connect 4.
 
