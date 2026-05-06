@@ -4,6 +4,7 @@ Game Rules:
 - Game ends when one player has 4 checkers in a row.
 """
 import os
+import copy
 import pygame
 import pygame.freetype
 import math
@@ -166,7 +167,7 @@ def main(p1='RLbotDDQN', p2='bot', epochs=1000, self_play=False, expr_dir=None, 
 
         for i, player in players_dict.items():
             # only store current self-play bot
-            if isinstance(player, RLBot) and player.turn==-1: 
+            if isinstance(player, (RLBot,PPOBot)) and player.turn==-1: 
                 player.save_model_and_results(model_path)
             
         results_df.reset_index(drop=True, inplace=True)
@@ -203,7 +204,7 @@ def main(p1='RLbotDDQN', p2='bot', epochs=1000, self_play=False, expr_dir=None, 
     is_test = test_paths is not None
 
     results_df = pd.DataFrame()
-    player_classes = {'player': Human, 'bot': Bot, 'RLbot': RLBot, 'RLbotDDQN': RLBotDDQN}
+    player_classes = {'player': Human, 'bot': Bot, 'RLbot': RLBot, 'RLbotDDQN': RLBotDDQN, 'PPObot':  PPOBot,}
     players = [p1, p2]
     p1_turn = -1
     if self_play:
@@ -263,7 +264,7 @@ def main(p1='RLbotDDQN', p2='bot', epochs=1000, self_play=False, expr_dir=None, 
 
     expr_dict = build_expr_dict(
         date=datetime.datetime.today().strftime('%m-%d-%Y-%H-%M-%S'),
-        p2=p2 if not isinstance(p2, RLBot) else p2.name,
+        p2=p2 if not isinstance(p2, (RLBot, PPOBot)) else p2.name,
         self_play=self_play,
         epochs=results_df.shape[0],
         expr_dir=expr_dir,
@@ -275,15 +276,15 @@ def main(p1='RLbotDDQN', p2='bot', epochs=1000, self_play=False, expr_dir=None, 
     log_models_and_results(players, results_df, expr_dir, expr_dict['expr_name'])
     if is_test:
         return None
-    elif isinstance(players[-1], RLBot):
+    elif isinstance(players[-1], (RLBot, PPOBot)):
         out_players = [players[-1].reset_self_play(turn=-1), copy.deepcopy(players[-1]).reset_self_play(turn=1)]
         return out_players, WIN_RATES[-1]
 
 def train_loop(expr_dir):
     """Implements cascading level self-play for RLbotDDQN"""
-    n_levels = 200
+    n_levels = 50
     games_per_level = 1000
-    players = ['RLbotDDQN', 'bot'] # starting pair
+    players = ['PPObot', 'bot'] # starting pair
     opp_cache = deque(maxlen=7)
     for n in range(n_levels):
         curr_player = copy.deepcopy(players[0])
@@ -296,10 +297,13 @@ def train_loop(expr_dir):
             level=n,
             opp_cache=opp_cache
             )
-        if win_rate>0.55:
+        if win_rate>0.5:
             opp_cache.append(players[1])
         else:
-            players = [curr_player.reset_self_play(turn=-1), copy.deepcopy(curr_player.reset_self_play(turn=1))]
+            players = [
+                curr_player.reset_self_play(turn=-1),
+                copy.deepcopy(curr_player).reset_self_play(turn=1)
+            ]
 
 def test_loop(expr_dir):
     """Implements training loop that gathers the last 'n' models to test"""
@@ -309,14 +313,37 @@ def test_loop(expr_dir):
     for p in paths:
         main(
             p1='RLbotDDQN',
-            p2='bot',
+            p2='player',
             epochs=200,
             expr_dir=expr_dir,
             self_play=False,
             test_paths={-1: p}
             )
 
+def comparison_loop(expr_dir_p1, expr_dir_p2):
+    """Implementation loop that tests agents from two separate model directories."""
+    last_n_models = 5
+
+    model_paths_p1 = os.listdir(f"models/{expr_dir_p1}")[-last_n_models:]
+    model_paths_p2 = os.listdir(f"models/{expr_dir_p2}")[-last_n_models:]
+
+    paths_p1 = [f"models/{expr_dir_p1}/{mp}/model.pth" for mp in model_paths_p1]
+    paths_p2 = [f"models/{expr_dir_p2}/{mp}/model.pth" for mp in model_paths_p2]
+
+    for p1_path, p2_path in zip(paths_p1, paths_p2):
+        main(
+            p1='RLbotDDQN',
+            p2='PPObot',
+            epochs=200,
+            expr_dir=expr_dir_p1,
+            self_play=False,
+            test_paths={-1: p1_path, 1: p2_path}
+        )
+
 if __name__=="__main__":
-    expr_dir = 'DDQN_selfplay_n200_cache7'
-    train_loop(expr_dir)
-    # test_loop(expr_dir)
+    expr_dir = 'DDQNtest'
+    expr_dir_p1 = 'DDQNtrain'
+    expr_dir_p2 = 'PPOtest'
+    train_loop(expr_dir_p1)
+    #test_loop(expr_dir)
+    #comparison_loop(expr_dir_p1, expr_dir_p2)

@@ -6,6 +6,11 @@ from typing import Dict
 import matplotlib.pyplot as plt
 from collections import deque
 import copy
+import gymnasium as gym
+from gymnasium import spaces
+from stable_baselines3 import PPO
+from stable_baselines3.common.policies import ActorCriticPolicy
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 class Player:
     def __init__(self, name: str, turn: int, test: bool) -> None:
@@ -301,3 +306,267 @@ class RLBotDDQN(RLBot):
         if result is not None: # game epoch is over
             self.reset_vars()
         return self
+
+class Connect4Env(gym.Env):
+    metadata = {"render_modes": []}
+    BOARD_ROWS, BOARD_COLS = 6, 7
+
+    def __init__(self):
+        super().__init__()
+        self.observation_space = spaces.Box(
+            low=0., high=1.,
+            shape=(2 * self.BOARD_ROWS * self.BOARD_COLS,),
+            dtype=np.float32
+        )
+        self.action_space = spaces.Discrete(self.BOARD_COLS)
+
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)
+        return np.zeros(self.observation_space.shape, dtype=np.float32), {}
+
+    def step(self, action):
+        return np.zeros(self.observation_space.shape, dtype=np.float32), 0., False, False, {}
+
+class Connect4FeatureExtractor(BaseFeaturesExtractor):
+    """84 → 200 → 500 → 200 → 50"""
+    def __init__(self, observation_space, features_dim=50):
+        super().__init__(observation_space, features_dim)
+        n = observation_space.shape[0]
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(n, 200),   torch.nn.ReLU(),
+            torch.nn.Linear(200, 200), torch.nn.ReLU(),
+            torch.nn.Linear(200, 500), torch.nn.ReLU(),
+            torch.nn.Linear(500, 200), torch.nn.ReLU(),
+            torch.nn.Linear(200, features_dim), torch.nn.ReLU(),
+        )
+    def forward(self, obs):
+        return self.net(obs)
+
+class PPOBot(Bot):
+    """
+    PPO agent using current interface
+    """
+
+    def __init__(
+        self,
+        name: str,
+        turn: int,
+        test: bool,
+        update_freq: int = 256,
+        n_epochs: int = 4,
+        lr: float = 1e-4,
+        gamma: float = 0.99,
+        gae_lambda: float = 0.95,
+        clip_range: float = 0.2,
+    ):
+        super().__init__(name, turn, test)
+
+        self.update_freq = update_freq
+        self.n_ppo_epochs = n_epochs
+        self.lr = lr
+        self.gamma = gamma
+        self.gae_lambda = gae_lambda
+        self.clip_range = clip_range
+
+        self.epsilon = self.get_epsilon()
+        self.epsilon_decay = 0.0004
+
+        policy_kwargs = dict(
+            features_extractor_class=Connect4FeatureExtractor,
+            features_extractor_kwargs=dict(features_dim=50),
+            net_arch=[],
+        )
+        self.model = PPO(
+            policy=ActorCriticPolicy,
+            env=Connect4Env(),
+            learning_rate=lr,
+            n_steps=update_freq,
+            batch_size=64,
+            n_epochs=n_epochs,
+            gamma=gamma,
+            gae_lambda=gae_lambda,
+            clip_range=clip_range,
+            policy_kwargs=policy_kwargs,
+            verbose=0,
+            device="cuda" if torch.cuda.is_available() else "cpu",
+        )
+
+        self._rollout: list = []
+
+        # keep tracking steps
+        self.stop_training = False
+        self.min_loss_dict = {"current_min": np.inf, "num_steps": 0}
+        self.patience = 600
+        self.losses: list = []
+        self.rewards: list = []
+        self.n_moves = 0
+        self.n_epoch_moves = 0
+        self.current_sqars = [None, None, None, None, None]
+
+        self.reward_vals = {"draw": 5, "win": 10, "loss": -10, "move": -1}
+
+    def get_epsilon(self):
+        return 0.25 # 0.0 if (self.turn != -1 or self.test) else
+
+    def _get_obs(self, piece_arrays: Dict) -> np.ndarray:
+        return np.stack([piece_arrays[self.turn], piece_arrays[-self.turn]]).reshape(-1).astype(np.float32)
+
+    def _available_mask(self, piece_arrays: Dict) -> np.ndarray:
+        board = piece_arrays[self.turn] + piece_arrays[-self.turn]
+        return board.sum(axis=0) < board.shape[0]
+
+    def move(self, piece_arrays: Dict) -> int:
+        obs  = self._get_obs(piece_arrays)
+        mask = self._available_mask(piece_arrays)
+
+        if random.random() < self.epsilon:
+            action = random.choice([i for i, ok in enumerate(mask) if ok])
+        else:
+            obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(self.model.policy.device)
+            with torch.no_grad():
+                dist = self.model.policy.get_distribution(obs_t)
+                logits = dist.distribution.logits.cpu().numpy().squeeze()
+            logits[~mask] = logits.min() - 1e6   # suppress illegal moves
+            action = int(np.argmax(logits))
+
+        self.epsilon *= (1 - self.epsilon_decay)
+        self.current_sqars[0] = obs
+        self.current_sqars[2] = action
+        self.n_moves += 1
+        self.n_epoch_moves += 1
+        return action
+
+    def get_reward(self, move_result) -> float:
+        if move_result is None:
+            r = self.reward_vals["move"]
+        elif "draw" in move_result:
+            r = self.reward_vals["draw"]
+        else:
+            win_side = int(move_result.split("_")[-1])
+            r = self.reward_vals["win"] if win_side == self.turn else self.reward_vals["loss"]
+        self.rewards.append(r)
+        return r
+
+    def train(self, new_piece_arrays: Dict, result):
+        if self.test:
+            return self
+
+        new_obs = self._get_obs(new_piece_arrays)
+        reward  = self.get_reward(result)
+        done    = result is not None
+
+        obs_t = torch.tensor(self.current_sqars[0], dtype=torch.float32).unsqueeze(0).to(self.model.policy.device)
+        act_t = torch.tensor([[self.current_sqars[2]]], dtype=torch.long).to(self.model.policy.device)
+        with torch.no_grad():
+            values, log_probs, _ = self.model.policy.evaluate_actions(obs_t, act_t)
+
+        self._rollout.append((
+            self.current_sqars[0], self.current_sqars[2],
+            reward, done, values.item(), log_probs.item(), new_obs
+        ))
+
+        if len(self._rollout) >= self.update_freq:
+            self.losses.append(self._ppo_update())
+            self._update_early_stopping()
+            self._rollout = []
+
+        if done:
+            self.reset_vars()
+        return self
+
+    def _ppo_update(self) -> float:
+        T, device = len(self._rollout), self.model.policy.device
+        obs_arr  = torch.tensor(np.array([x[0] for x in self._rollout]), dtype=torch.float32).to(device)
+        acts_arr = torch.tensor([x[1] for x in self._rollout], dtype=torch.long).to(device)
+        rews_arr = np.array([x[2] for x in self._rollout], dtype=np.float32)
+        done_arr = np.array([x[3] for x in self._rollout], dtype=np.float32)
+        vals_arr = np.array([x[4] for x in self._rollout], dtype=np.float32)
+        lps_arr  = torch.tensor([x[5] for x in self._rollout], dtype=torch.float32).to(device)
+        next_obs = torch.tensor(self._rollout[-1][6], dtype=torch.float32).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            last_val = self.model.policy.predict_values(next_obs).item()
+        advantages, gae = np.zeros(T, dtype=np.float32), 0.
+        for t in reversed(range(T)):
+            nv    = last_val if t == T - 1 else vals_arr[t + 1]
+            delta = rews_arr[t] + self.gamma * nv * (1 - done_arr[t]) - vals_arr[t]
+            gae   = delta + self.gamma * self.gae_lambda * (1 - done_arr[t]) * gae
+            advantages[t] = gae
+        returns    = advantages + vals_arr
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        adv_t = torch.tensor(advantages, dtype=torch.float32).to(device)
+        ret_t = torch.tensor(returns,    dtype=torch.float32).to(device)
+
+        total, n = 0., 0
+        for _ in range(self.n_ppo_epochs):
+            for idx in [np.random.permutation(T)[s:s+64] for s in range(0, T, 64)]:
+                new_vals, new_lps, entropy = self.model.policy.evaluate_actions(
+                    obs_arr[idx], acts_arr[idx]
+                )
+                ratio = torch.exp(new_lps - lps_arr[idx])
+                policy_loss = -torch.min(
+                    ratio * adv_t[idx],
+                    torch.clamp(ratio, 1 - self.clip_range, 1 + self.clip_range) * adv_t[idx]
+                ).mean()
+                value_loss   = 0.5 * ((new_vals.squeeze() - ret_t[idx]) ** 2).mean()
+                entropy_loss = -0.01 * entropy.mean()
+                loss = policy_loss + value_loss + entropy_loss
+
+                self.model.policy.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.policy.parameters(), 0.5)
+                self.model.policy.optimizer.step()
+                total += loss.item(); n += 1
+        return total / max(n, 1)
+
+    # not implemented, ignore
+    def _update_early_stopping(self):
+        w = 50
+        if len(self.losses) >= w:
+            avg = np.mean(self.losses[-w:])
+            if avg < self.min_loss_dict["current_min"]:
+                self.min_loss_dict["current_min"] = avg
+                self.min_loss_dict["num_steps"] = 0
+            else:
+                self.min_loss_dict["num_steps"] += 1
+            if self.min_loss_dict["num_steps"] >= self.patience:
+                self.stop_training = True
+
+    def reset_vars(self):
+        self.current_sqars = [None, None, None, None, None]
+        self.n_epoch_moves = 0
+
+    def reset_self_play(self, turn: int):
+        self.turn = turn
+        self.epsilon = self.get_epsilon()
+        self.losses = []; self.rewards = []
+        self.n_moves = 0; self.n_epoch_moves = 0
+        self.current_sqars = [None, None, None, None, None]
+        self._rollout = []
+        self.stop_training = False
+        self.min_loss_dict = {"current_min": np.inf, "num_steps": 0}
+
+        return self
+
+    def save_model_and_results(self, model_path: str):
+        torch.save(self.model.policy.state_dict(), model_path + "model.pth")
+        np.savetxt(model_path + "ppo_losses.csv", np.array(self.losses),
+                   delimiter=",", header="losses")
+        self.plot_results(save_path=model_path + "ppo_results.png")
+
+    def load_model(self, path):
+        state = torch.load(path, map_location=self.model.policy.device)
+        self.model.policy.load_state_dict(state)
+        self.model.policy.set_training_mode(False)
+        return self
+
+    def plot_results(self, show=False, save_path=None):
+        fig, ax1 = plt.subplots()
+        ax1.set_xlabel("Moves");  ax1.set_ylabel("Rewards", color="r")
+        ax1.plot(np.arange(len(self.rewards)), self.rewards, color="r", alpha=0.5)
+        ax2 = ax1.twinx();        ax2.set_ylabel("Loss", color="b")
+        ax2.plot(np.arange(len(self.losses)),  self.losses,  color="b", alpha=0.7)
+        fig.tight_layout()
+        if save_path: plt.savefig(save_path)
+        if show:      plt.show()
+        plt.clf()
